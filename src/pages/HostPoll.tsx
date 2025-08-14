@@ -1,50 +1,55 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import * as signalR from "@microsoft/signalr";
+import { pollService } from "../services/pollService";
+import { SignalRService, type PollData } from "../services/signalrService";
 
 export default function HostPoll() {
   // ---- Config ----
-  const [baseUrl, setBaseUrl] = useState<string>("http://localhost:5080");
+  const baseUrl = import.meta.env.VITE_BACKEND || "http://localhost:5236";
   const [question, setQuestion] = useState("");
   const [optionInput, setOptionInput] = useState("");
   const [options, setOptions] = useState<string[]>(["A", "B", "C"]);
+  const [password, setPassword] = useState("");
+  const [usePassword, setUsePassword] = useState(false);
   const [creating, setCreating] = useState(false);
   const [roomId, setRoomId] = useState("");
   const [joined, setJoined] = useState(false);
-  const [poll, setPoll] = useState<{ question: string; options: Record<string, number> } | null>(null);
-  const connectionRef = useRef<signalR.HubConnection | null>(null);
-  const [connecting, setConnecting] = useState(false);
-  const hubUrl = useMemo(() => `${baseUrl.replace(/\/$/, "")}/pollHub`, [baseUrl]);
+  const [poll, setPoll] = useState<PollData | null>(null);
+  const signalRServiceRef = useRef<SignalRService | null>(null);
+
+  // Initialize SignalR service
+  const signalRService = useMemo(() => {
+    if (!signalRServiceRef.current) {
+      signalRServiceRef.current = new SignalRService(baseUrl);
+    }
+    return signalRServiceRef.current;
+  }, [baseUrl]);
 
   async function ensureConnection() {
-    if (connectionRef.current?.state === signalR.HubConnectionState.Connected) return;
-    setConnecting(true);
-    const conn = new signalR.HubConnectionBuilder()
-      .withUrl(hubUrl)
-      .withAutomaticReconnect()
-      .build();
-    conn.on("PollUpdated", (p) => {
-      setPoll({ question: p.question, options: p.options });
-    });
-    await conn.start();
-    connectionRef.current = conn;
-    setConnecting(false);
+    try {
+      await signalRService.connect();
+      signalRService.onPollUpdated((p) => {
+        setPoll({ question: p.question, options: p.options });
+      });
+    } catch (error) {
+      console.error("Connection failed:", error);
+    }
   }
 
   async function createPoll() {
     if (!question.trim() || options.length === 0) return;
     try {
       setCreating(true);
-      const res = await fetch(`${baseUrl.replace(/\/$/, "")}/api/polls`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: question.trim(), options }),
-      });
-      if (!res.ok) throw new Error(`Create failed: ${res.status}`);
-      const data = await res.json();
-      const createdRoomId = data.roomId as string;
-      setRoomId(createdRoomId);
-      setJoined(true);
       await ensureConnection();
+      
+      const pollData = {
+        question: question.trim(),
+        options,
+        ...(usePassword && password.trim() && { password: password.trim() })
+      };
+      
+      const result = await pollService.createPoll(pollData);
+      setRoomId(result.roomId);
+      setJoined(true);
     } catch (e) {
       alert((e as Error).message);
     } finally {
@@ -54,9 +59,9 @@ export default function HostPoll() {
 
   useEffect(() => {
     return () => {
-      connectionRef.current?.stop();
+      signalRService.disconnect();
     };
-  }, []);
+  }, [signalRService]);
 
   function addOption() {
     const v = optionInput.trim();
@@ -87,6 +92,35 @@ export default function HostPoll() {
             onChange={(e) => setQuestion(e.target.value)}
             placeholder="Câu hỏi bình chọn"
           />
+          
+          {/* Password Section */}
+          <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
+            <div className="flex items-center gap-3 mb-3">
+              <input
+                type="checkbox"
+                id="usePassword"
+                checked={usePassword}
+                onChange={(e) => setUsePassword(e.target.checked)}
+                className="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
+              />
+              <label htmlFor="usePassword" className="text-sm font-medium text-slate-700">
+                Bảo vệ phòng bằng mật khẩu (tùy chọn)
+              </label>
+            </div>
+            {usePassword && (
+              <input
+                type="password"
+                className="w-full rounded-xl border border-slate-300 p-3 outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-colors"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Nhập mật khẩu phòng"
+              />
+            )}
+            <p className="text-xs text-slate-500 mt-2">
+              {usePassword ? "Người tham gia sẽ cần nhập mật khẩu để vào phòng" : "Phòng công khai, ai cũng có thể tham gia"}
+            </p>
+          </div>
+          
           <div className="grid md:grid-cols-3 gap-3">
             <div className="md:col-span-2">
               <div className="flex gap-2">
@@ -130,7 +164,22 @@ export default function HostPoll() {
         </section>
         {joined && (
           <section className="bg-white rounded-2xl shadow p-4 md:p-6 grid gap-4 mt-8">
-            <h2 className="text-lg font-semibold">Kết quả bình chọn trực tiếp</h2>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold">Kết quả bình chọn trực tiếp</h2>
+              <div className="flex gap-3">
+                <div className="bg-indigo-100 px-4 py-2 rounded-lg">
+                  <span className="text-indigo-800 font-medium">Mã phòng: {roomId}</span>
+                </div>
+                {usePassword && (
+                  <div className="bg-amber-100 px-4 py-2 rounded-lg flex items-center gap-2">
+                    <svg className="w-4 h-4 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                    </svg>
+                    <span className="text-amber-800 font-medium">Có mật khẩu</span>
+                  </div>
+                )}
+              </div>
+            </div>
             <div className="text-xl font-medium">{poll?.question}</div>
             <div className="grid gap-3">
               {poll && Object.entries(poll.options).map(([opt, count]) => {

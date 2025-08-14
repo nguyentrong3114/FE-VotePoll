@@ -1,49 +1,114 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import * as signalR from "@microsoft/signalr";
+import { useLocation } from "react-router-dom";
+import { SignalRService, type PollData } from "../services/signalrService";
+import { toast } from 'react-toastify';
 
 export default function ParticipantPoll() {
   // ---- Config ----
-  const [baseUrl, setBaseUrl] = useState<string>("http://localhost:5080");
+  const baseUrl = import.meta.env.VITE_BACKEND || "http://localhost:5236";
+  const location = useLocation();
   const [roomId, setRoomId] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPasswordInput, setShowPasswordInput] = useState(false);
+  const [presetPassword, setPresetPassword] = useState(false);
   const [joined, setJoined] = useState(false);
-  const [poll, setPoll] = useState<{ question: string; options: Record<string, number> } | null>(null);
+  const [poll, setPoll] = useState<PollData | null>(null);
   const [hasVoted, setHasVoted] = useState(false);
   const [connecting, setConnecting] = useState(false);
-  const connectionRef = useRef<signalR.HubConnection | null>(null);
+  const signalRServiceRef = useRef<SignalRService | null>(null);
   
-  const hubUrl = useMemo(() => `${baseUrl.replace(/\/$/, "")}/pollHub`, [baseUrl]);
+  // Initialize SignalR service
+  const signalRService = useMemo(() => {
+    if (!signalRServiceRef.current) {
+      signalRServiceRef.current = new SignalRService(baseUrl);
+    }
+    return signalRServiceRef.current;
+  }, [baseUrl]);
+
+  // Check if roomId was passed from navigation
+  useEffect(() => {
+    const state = location.state as { roomId?: string } | null;
+    if (state?.roomId) {
+      setRoomId(state.roomId);
+      // Auto-join if roomId is provided
+      setTimeout(() => {
+        if (state.roomId) {
+          joinRoom(state.roomId);
+        }
+      }, 500);
+    }
+  }, [location.state]);
 
   async function ensureConnection() {
-    if (connectionRef.current?.state === signalR.HubConnectionState.Connected) return;
-    setConnecting(true);
-    const conn = new signalR.HubConnectionBuilder()
-      .withUrl(hubUrl)
-      .withAutomaticReconnect()
-      .build();
-    
-    conn.on("PollUpdated", (p) => {
-      setPoll({ question: p.question, options: p.options });
-    });
-    
-    conn.onclose(() => {
-      setConnecting(false);
-    });
-    
-    await conn.start();
-    connectionRef.current = conn;
-    setConnecting(false);
+    try {
+      await signalRService.ensureConnection();
+      signalRService.onPollUpdated((p) => {
+        setPoll({ question: p.question, options: p.options });
+      });
+    } catch (error) {
+      console.error("Connection failed:", error);
+      throw error;
+    }
   }
 
   async function joinRoom(targetRoomId: string) {
     if (!targetRoomId) return;
     try {
+      setConnecting(true);
       await ensureConnection();
-      await connectionRef.current!.invoke("JoinRoom", targetRoomId);
-      setRoomId(targetRoomId);
-      setJoined(true);
-      setHasVoted(false);
-    } catch (error) {
-      alert("Không thể tham gia phòng. Vui lòng kiểm tra mã phòng!");
+      
+      // Thử join không mật khẩu trước
+      const result = await signalRService.joinRoom(targetRoomId);
+      
+      if (result.success) {
+        setRoomId(targetRoomId);
+        setJoined(true);
+        setHasVoted(false);
+        setConnecting(false);
+        setShowPasswordInput(false);
+        setPresetPassword(false);
+        setPassword("");
+        toast.success("Đã tham gia phòng thành công!");
+      } else {
+        setConnecting(false);
+        // Nếu cần mật khẩu
+        if (result.requiresPassword) {
+          setShowPasswordInput(true);
+          toast.warning(result.message || "Phòng này yêu cầu mật khẩu. Vui lòng nhập mật khẩu bên dưới!");
+        } else {
+          toast.error(result.message || "Không thể tham gia phòng!");
+        }
+      }
+    } catch (error: any) {
+      setConnecting(false);
+      toast.error("Lỗi kết nối. Vui lòng thử lại!");
+    }
+  }
+
+  async function joinRoomWithPassword(targetRoomId: string, roomPassword: string) {
+    if (!targetRoomId || !roomPassword.trim()) return;
+    try {
+      setConnecting(true);
+      await ensureConnection();
+      
+      const result = await signalRService.joinRoom(targetRoomId, roomPassword.trim());
+      
+      if (result.success) {
+        setRoomId(targetRoomId);
+        setJoined(true);
+        setHasVoted(false);
+        setConnecting(false);
+        setShowPasswordInput(false); // Ẩn input mật khẩu khi thành công
+        setPresetPassword(false);
+        setPassword("");
+        toast.success("Đã tham gia phòng thành công!");
+      } else {
+        setConnecting(false);
+        toast.error(result.message || "Mật khẩu không đúng hoặc không thể tham gia phòng!");
+      }
+    } catch (error: any) {
+      setConnecting(false);
+      toast.error("Lỗi kết nối. Vui lòng thử lại!");
     }
   }
 
@@ -51,18 +116,24 @@ export default function ParticipantPoll() {
     if (!joined || !roomId || hasVoted) return;
     try {
       await ensureConnection();
-      await connectionRef.current!.invoke("Vote", roomId, opt);
-      setHasVoted(true);
+      const success = await signalRService.vote(roomId, opt);
+      
+      if (success) {
+        setHasVoted(true);
+        toast.success("Đã gửi phiếu bầu thành công!");
+      } else {
+        toast.error("Không thể gửi phiếu bầu. Vui lòng thử lại!");
+      }
     } catch (error) {
-      alert("Không thể gửi phiếu bầu. Vui lòng thử lại!");
+      toast.error("Lỗi khi gửi phiếu bầu. Vui lòng thử lại!");
     }
   }
 
   useEffect(() => {
     return () => {
-      connectionRef.current?.stop();
+      signalRService.disconnect();
     };
-  }, []);
+  }, [signalRService]);
 
   const totalVotes = useMemo(() => {
     if (!poll) return 0;
@@ -71,39 +142,6 @@ export default function ParticipantPoll() {
 
   return (
     <div className="space-y-8">
-      {/* Connection Settings */}
-      {!joined && (
-        <div className="bg-white rounded-2xl shadow-lg p-6 border border-slate-200">
-          <h2 className="text-xl font-semibold text-slate-900 mb-4">Cài đặt kết nối</h2>
-          <div className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-slate-700 mb-2">URL Backend</label>
-              <input
-                className="w-full rounded-xl border border-slate-300 p-3 outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-colors"
-                value={baseUrl}
-                onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder="http://localhost:5080"
-              />
-            </div>
-            <button
-              className="w-full px-4 py-3 rounded-xl bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-60 transition-colors"
-              disabled={connecting}
-              onClick={() => ensureConnection()}
-            >
-              {connecting ? "Đang kết nối..." : "Kết nối"}
-            </button>
-            {connectionRef.current?.state === signalR.HubConnectionState.Connected && (
-              <div className="text-sm text-emerald-600 flex items-center gap-2">
-                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-                </svg>
-                Đã kết nối thành công
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* Join Room */}
       {!joined && (
         <div className="bg-white rounded-2xl shadow-lg p-6 border border-slate-200">
@@ -119,12 +157,99 @@ export default function ParticipantPoll() {
                 maxLength={10}
               />
             </div>
+
+            {/* Checkbox để hiển thị trường mật khẩu */}
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                id="hasPassword"
+                checked={presetPassword}
+                onChange={(e) => {
+                  setPresetPassword(e.target.checked);
+                  if (!e.target.checked) {
+                    setPassword("");
+                  }
+                }}
+                className="w-4 h-4 text-emerald-600 border-slate-300 rounded focus:ring-emerald-500"
+              />
+              <label htmlFor="hasPassword" className="text-sm text-slate-600 cursor-pointer">
+                Phòng này có mật khẩu
+              </label>
+            </div>
+
+            {/* Trường mật khẩu tự chọn */}
+            {presetPassword && (
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                <div className="flex items-center gap-2 mb-3">
+                  <svg className="w-5 h-5 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                  </svg>
+                  <span className="text-slate-700 font-medium">Mật khẩu phòng</span>
+                </div>
+                <div>
+                  <input
+                    type="password"
+                    className="w-full rounded-xl border border-slate-300 p-3 outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-colors"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Nhập mật khẩu phòng"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        if (password.trim()) {
+                          joinRoomWithPassword(roomId, password);
+                        } else {
+                          joinRoom(roomId);
+                        }
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+            
+            {showPasswordInput && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+                <div className="flex items-center gap-2 mb-3">
+                  <svg className="w-5 h-5 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                  </svg>
+                  <span className="text-amber-800 font-medium">Phòng này có mật khẩu</span>
+                </div>
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-sm font-medium text-amber-800 mb-2">Mật khẩu phòng</label>
+                    <input
+                      type="password"
+                      className="w-full rounded-xl border border-amber-300 p-3 outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-colors"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="Nhập mật khẩu phòng"
+                      onKeyDown={(e) => e.key === "Enter" && joinRoomWithPassword(roomId, password)}
+                    />
+                  </div>
+                  <button
+                    onClick={() => joinRoomWithPassword(roomId, password)}
+                    className="w-full px-6 py-3 rounded-xl bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-60 transition-colors font-medium"
+                    disabled={!password.trim() || connecting}
+                  >
+                    {connecting ? "Đang tham gia..." : "Tham gia với mật khẩu"}
+                  </button>
+                </div>
+              </div>
+            )}
+            
             <button
-              onClick={() => joinRoom(roomId)}
+              onClick={() => {
+                if (presetPassword && password.trim()) {
+                  joinRoomWithPassword(roomId, password);
+                } else {
+                  joinRoom(roomId);
+                }
+              }}
               className="w-full px-6 py-3 rounded-xl bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-60 transition-colors font-medium"
-              disabled={!roomId || connectionRef.current?.state !== signalR.HubConnectionState.Connected}
+              disabled={!roomId || connecting || showPasswordInput}
             >
-              Tham gia bình chọn
+              {connecting ? "Đang kết nối..." : presetPassword && password.trim() ? "Tham gia với mật khẩu" : "Tham gia bình chọn"}
             </button>
           </div>
         </div>
